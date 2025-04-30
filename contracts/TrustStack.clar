@@ -100,3 +100,158 @@
         (milestone-completed? (unwrap-panic (element-at service-milestones u4)))
     )
 )
+
+(define-private (validate-service-provider (provider principal))
+    (and 
+        (not (is-eq provider tx-sender))  ;; Provider cannot be the client
+        (not (is-eq provider contract-administrator))  ;; Provider cannot be the admin
+        (not (is-eq provider (as-contract tx-sender)))  ;; Provider cannot be the contract itself
+    )
+)
+
+(define-private (validate-milestone-payments (milestones (list 5 {
+        milestone-description: (string-utf8 100),
+        milestone-payment: uint,
+        milestone-completed: bool
+    })) 
+    (total-cost uint))
+    (let ((total-milestone-payments (+ 
+            (get milestone-payment (unwrap-panic (element-at milestones u0)))
+            (get milestone-payment (unwrap-panic (element-at milestones u1)))
+            (get milestone-payment (unwrap-panic (element-at milestones u2)))
+            (get milestone-payment (unwrap-panic (element-at milestones u3)))
+            (get milestone-payment (unwrap-panic (element-at milestones u4)))
+        )))
+        (and 
+            (is-eq total-milestone-payments total-cost)  ;; Sum of milestone payments must equal total cost
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u0)))) u0)  ;; Validate descriptions
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u1)))) u0)
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u2)))) u0)
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u3)))) u0)
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u4)))) u0)
+        )
+    )
+)
+
+(define-private (update-milestone-at-index 
+    (milestone {
+        milestone-description: (string-utf8 100),
+        milestone-payment: uint,
+        milestone-completed: bool
+    })
+    (target-index uint)
+    (index uint))
+    {
+        milestone-description: (get milestone-description milestone),
+        milestone-payment: (get milestone-payment milestone),
+        milestone-completed: (if (is-eq index target-index) 
+                               true 
+                               (get milestone-completed milestone))
+    }
+)
+
+;; Public functions
+(define-public (create-service-agreement (agreement-identifier uint) 
+                                       (service-provider-address principal)
+                                       (total-service-cost uint)
+                                       (agreement-duration uint)
+                                       (service-milestones (list 5 {
+                                           milestone-description: (string-utf8 100),
+                                           milestone-payment: uint,
+                                           milestone-completed: bool
+                                       })))
+    (let ((current-block block-height))
+        (asserts! (is-none (get-agreement-details agreement-identifier)) ERROR_AGREEMENT_ALREADY_EXISTS)
+        (asserts! (> total-service-cost u0) ERROR_INSUFFICIENT_PAYMENT)
+        (asserts! (> agreement-duration u0) ERROR_INVALID_INPUT)
+        (asserts! (validate-service-provider service-provider-address) ERROR_INVALID_SERVICE_PROVIDER)
+        (asserts! (validate-milestone-payments service-milestones total-service-cost) ERROR_INVALID_MILESTONE_DATA)
+
+        (map-set service-agreement-details
+            { agreement-identifier: agreement-identifier }
+            {
+                service-provider-address: service-provider-address,
+                client-address: tx-sender,
+                total-service-cost: total-service-cost,
+                agreement-status: agreement-status-awaiting-payment,
+                agreement-start-block: current-block,
+                agreement-end-block: (+ current-block agreement-duration),
+                dispute-filing-deadline-block: (+ (+ current-block agreement-duration) u144), ;; ~1 day after end (assuming ~10min blocks)
+                service-milestones: service-milestones
+            }
+        )
+
+        (map-set agreement-payment-escrow
+            { agreement-identifier: agreement-identifier }
+            { escrowed-amount: u0 }
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (deposit-payment (agreement-identifier uint) (payment-amount uint))
+    (let ((agreement-info (unwrap! (get-agreement-details agreement-identifier) ERROR_AGREEMENT_NOT_FOUND))
+          (current-escrow-balance (get escrowed-amount (get-escrowed-payment agreement-identifier))))
+
+        (asserts! (is-eq tx-sender (get client-address agreement-info)) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-eq (get agreement-status agreement-info) agreement-status-awaiting-payment) ERROR_INVALID_AGREEMENT_STATUS)
+        (asserts! (> payment-amount u0) ERROR_INVALID_INPUT)
+
+        (try! (stx-transfer? payment-amount tx-sender (as-contract tx-sender)))
+
+        (let ((new-escrow-balance (+ current-escrow-balance payment-amount)))
+            (map-set agreement-payment-escrow
+                { agreement-identifier: agreement-identifier }
+                { escrowed-amount: new-escrow-balance }
+            )
+
+            (if (>= new-escrow-balance (get total-service-cost agreement-info))
+                (map-set service-agreement-details
+                    { agreement-identifier: agreement-identifier }
+                    (merge agreement-info { agreement-status: agreement-status-active })
+                )
+                true
+            )
+
+            (ok true)
+        )
+    )
+)
+
+(define-public (mark-milestone-complete (agreement-identifier uint) (milestone-index uint))
+    (let ((agreement-info (unwrap! (get-agreement-details agreement-identifier) ERROR_AGREEMENT_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get service-provider-address agreement-info)) ERROR_UNAUTHORIZED_ACCESS)
+        (asserts! (is-eq (get agreement-status agreement-info) agreement-status-active) ERROR_INVALID_AGREEMENT_STATUS)
+        (asserts! (< milestone-index (len (get service-milestones agreement-info))) ERROR_INVALID_MILESTONE_INDEX)
+
+        (let ((milestones (get service-milestones agreement-info))
+              (updated-service-milestones 
+                (list 
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u0)) milestone-index u0)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u1)) milestone-index u1)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u2)) milestone-index u2)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u3)) milestone-index u3)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u4)) milestone-index u4)
+                )))
+
+            (map-set service-agreement-details
+                { agreement-identifier: agreement-identifier }
+                (merge agreement-info { service-milestones: updated-service-milestones })
+            )
+
+            (if (verify-all-milestones-complete updated-service-milestones)
+                (map-set service-agreement-details
+                    { agreement-identifier: agreement-identifier }
+                    (merge agreement-info { 
+                        agreement-status: agreement-status-delivered,
+                        service-milestones: updated-service-milestones 
+                    })
+                )
+                true
+            )
+
+            (ok true)
+        )
+    )
+)
